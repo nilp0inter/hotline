@@ -308,17 +308,31 @@ impl RealtimeTranscriber {
                 }
             });
 
-            // Wait for both tasks
-            let _ = tokio::join!(audio_task, receive_task);
+            // Wait for both tasks to complete
+            let (audio_result, receive_result) = tokio::join!(audio_task, receive_task);
+            if let Err(e) = audio_result {
+                eprintln!("Audio task panicked or errored during join: {}", e);
+            }
+            if let Err(e) = receive_result {
+                eprintln!("Receive task panicked or errored during join: {}", e);
+            }
 
             // Send close frame to cleanly disconnect WebSocket
-            eprintln!("Closing WebSocket connection...");
+            eprintln!("WebSocket task shutting down. Sending Close frame...");
             {
                 let mut sender = ws_sender_shutdown.lock().await;
-                let _ = sender.send(Message::Close(None)).await;
-                let _ = sender.close().await;
+                if sender.send(Message::Close(None)).await.is_ok() {
+                    if sender.close().await.is_ok() {
+                        eprintln!("WebSocket connection closed gracefully.");
+                    } else {
+                        eprintln!(
+                            "Failed to close WebSocket sink, connection may have been dropped."
+                        );
+                    }
+                } else {
+                    eprintln!("Failed to send Close frame, connection was likely already closed.");
+                }
             }
-            eprintln!("WebSocket connection closed");
         });
 
         Ok((audio_tx, transcript_rx, ws_task, shutdown_tx))

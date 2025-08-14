@@ -304,6 +304,77 @@ async fn run_sendcmd() -> Result<()> {
     }
 }
 
+// New private helper function to unify cleanup logic
+#[cfg(not(test))]
+async fn perform_transcription_cleanup(
+    state: &RealtimeState,
+    sound_manager: &SoundManager,
+    command_executor: &CommandExecutor,
+    source_of_stop: &str,
+) {
+    use std::sync::atomic::Ordering;
+
+    // Atomically check and set recording flag to false.
+    // If it was already false, another cleanup task is in progress or has finished.
+    if !state.is_recording.swap(false, Ordering::Relaxed) {
+        return;
+    }
+
+    eprintln!(
+        "Initiating transcription cleanup from source: {}",
+        source_of_stop
+    );
+
+    // 1. Execute on_transcription_stop hook
+    let hooks = state.current_hooks.lock().await.clone();
+    if let Some(hooks) = hooks {
+        if let Some(stop_hook) = hooks.on_transcription_stop {
+            match stop_hook {
+                socket::CommandExecution::Spawn { command }
+                | socket::CommandExecution::SpawnWithStdin { command } => {
+                    command_executor.execute_hook("on_transcription_stop", &command, String::new());
+                }
+            }
+        }
+    }
+
+    // 2. Play stop sound and wait for it to complete
+    if let Err(e) = sound_manager.play_recording_stop().await {
+        eprintln!("Failed to play recording stop sound: {}", e);
+    }
+
+    // 3. Close audio sender to stop audio data flowing to WebSocket.
+    // This is done by dropping the sender.
+    *state.audio_sender.lock().await = None;
+
+    // 4. Send shutdown signal to the WebSocket task
+    if let Some(shutdown_tx) = state.ws_shutdown.lock().await.take() {
+        if shutdown_tx.send(()).await.is_ok() {
+            eprintln!("Sent WebSocket shutdown signal.");
+        } else {
+            eprintln!("WebSocket shutdown channel was already closed, task may have self-terminated.");
+        }
+    }
+
+    // 5. Wait for the WebSocket task to complete
+    if let Some(task) = state.ws_task.lock().await.take() {
+        eprintln!("Waiting for WebSocket task to finish...");
+        match tokio::time::timeout(tokio::time::Duration::from_secs(2), task).await {
+            Ok(Ok(_)) => eprintln!("WebSocket task completed successfully."),
+            Ok(Err(e)) => eprintln!("WebSocket task panicked or errored during join: {}", e),
+            Err(_) => eprintln!("WebSocket task did not complete in time (timed out)."),
+        }
+    }
+
+    // 6. Clear current hooks from state
+    *state.current_hooks.lock().await = None;
+
+    eprintln!(
+        "Transcription cleanup completed for source: {}",
+        source_of_stop
+    );
+}
+
 #[cfg(not(test))]
 fn handle_command(
     cmd: socket::Command,
@@ -427,28 +498,26 @@ fn handle_command(
                                     Err(e) => {
                                         eprintln!("Transcription error: {}", e);
                                         sound_manager_inner.play_error();
-                                        state_inner.is_recording.store(false, Ordering::Relaxed);
-
-                                        // Send shutdown signal to cleanly close WebSocket
-                                        if let Some(shutdown_tx) =
-                                            state_inner.ws_shutdown.lock().await.take()
-                                        {
-                                            let _ = shutdown_tx.send(()).await;
-                                        }
-
-                                        if let Some(task) = state_inner.ws_task.lock().await.take()
-                                        {
-                                            let _ = tokio::time::timeout(
-                                                tokio::time::Duration::from_secs(1),
-                                                task,
-                                            )
-                                            .await;
-                                        }
-                                        *state_inner.audio_sender.lock().await = None;
-                                        break;
+                                        perform_transcription_cleanup(
+                                            &state_inner,
+                                            &sound_manager_inner,
+                                            &command_executor_inner,
+                                            "TranscriptionError",
+                                        )
+                                        .await;
+                                        return; // Exit the task
                                     }
                                 }
                             }
+                            // This block is reached when transcript_rx.recv() returns None,
+                            // indicating the WebSocket task has terminated.
+                            perform_transcription_cleanup(
+                                &state_inner,
+                                &sound_manager_inner,
+                                &command_executor_inner,
+                                "StreamEnd",
+                            )
+                            .await;
                         });
 
                         eprintln!("Audio streaming started");
@@ -474,53 +543,17 @@ fn handle_command(
                 });
             }
 
-            // Stop transcription
-            state.is_recording.store(false, Ordering::Relaxed);
-
             let state_clone = state.clone();
             let sound_manager_clone = sound_manager.clone();
             let command_executor_clone = command_executor.clone();
             tokio::spawn(async move {
-                // First, execute on_transcription_stop hook BEFORE playing stop sound
-                let hooks = state_clone.current_hooks.lock().await.clone();
-                if let Some(hooks) = hooks {
-                    if let Some(stop_hook) = hooks.on_transcription_stop {
-                        match stop_hook {
-                            socket::CommandExecution::Spawn { command }
-                            | socket::CommandExecution::SpawnWithStdin { command } => {
-                                command_executor_clone.execute_hook(
-                                    "on_transcription_stop",
-                                    &command,
-                                    String::new(),
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Now play stop beep and wait for it to complete
-                if let Err(e) = sound_manager_clone.play_recording_stop().await {
-                    eprintln!("Failed to play recording stop sound: {}", e);
-                }
-
-                // Only close audio resources AFTER the stop sound has finished
-                *state_clone.audio_sender.lock().await = None;
-
-                // Send shutdown signal to cleanly close WebSocket
-                if let Some(shutdown_tx) = state_clone.ws_shutdown.lock().await.take() {
-                    let _ = shutdown_tx.send(()).await;
-                }
-
-                // Wait for WebSocket task to complete cleanly
-                if let Some(task) = state_clone.ws_task.lock().await.take() {
-                    // Give it a moment to close cleanly, then abort if needed
-                    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), task).await;
-                }
-
-                // Clear hooks from state
-                *state_clone.current_hooks.lock().await = None;
-
-                eprintln!("Audio streaming stopped");
+                perform_transcription_cleanup(
+                    &state_clone,
+                    &sound_manager_clone,
+                    &command_executor_clone,
+                    "StopTranscriptionCommand",
+                )
+                .await;
             });
 
             Ok(socket::Response::Success {
@@ -531,63 +564,24 @@ fn handle_command(
             // Check if currently recording
             if state.is_recording.load(Ordering::Relaxed) {
                 // Currently recording, so stop it
-                state.is_recording.store(false, Ordering::Relaxed);
-
                 let state_clone = state.clone();
                 let sound_manager_clone = sound_manager.clone();
                 let command_executor_clone = command_executor.clone();
                 tokio::spawn(async move {
-                    // First, execute on_transcription_stop hook BEFORE playing stop sound
-                    let hooks = state_clone.current_hooks.lock().await.clone();
-                    if let Some(hooks) = hooks {
-                        if let Some(stop_hook) = hooks.on_transcription_stop {
-                            match stop_hook {
-                                socket::CommandExecution::Spawn { command }
-                                | socket::CommandExecution::SpawnWithStdin { command } => {
-                                    command_executor_clone.execute_hook(
-                                        "on_transcription_stop",
-                                        &command,
-                                        String::new(),
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    // Now play stop beep and wait for it to complete
-                    if let Err(e) = sound_manager_clone.play_recording_stop().await {
-                        eprintln!("Failed to play recording stop sound: {}", e);
-                    }
-
-                    // Only close audio resources AFTER the stop sound has finished
-                    *state_clone.audio_sender.lock().await = None;
-
-                    // Send shutdown signal to cleanly close WebSocket
-                    if let Some(shutdown_tx) = state_clone.ws_shutdown.lock().await.take() {
-                        let _ = shutdown_tx.send(()).await;
-                    }
-
-                    // Wait for WebSocket task to complete cleanly
-                    if let Some(task) = state_clone.ws_task.lock().await.take() {
-                        // Give it a moment to close cleanly, then abort if needed
-                        let _ =
-                            tokio::time::timeout(tokio::time::Duration::from_secs(2), task).await;
-                    }
-
-                    // Clear hooks from state
-                    *state_clone.current_hooks.lock().await = None;
-
-                    eprintln!("Audio streaming stopped (toggled)");
+                    perform_transcription_cleanup(
+                        &state_clone,
+                        &sound_manager_clone,
+                        &command_executor_clone,
+                        "ToggleTranscriptionCommand (stop)",
+                    )
+                    .await;
                 });
 
                 Ok(socket::Response::Success {
                     message: "Toggled: Stopping transcription".to_string(),
                 })
             } else {
-                // Not recording, so start it
-                // This is the same logic as StartTranscription
-
-                // Use provided language or fall back to config
+                // Not recording, so start it (logic mirrors StartTranscription)
                 let language = args.language.or_else(|| {
                     if config.whisper_language == "auto" {
                         None
@@ -595,22 +589,15 @@ fn handle_command(
                         Some(config.whisper_language.clone())
                     }
                 });
-
-                // Extract hooks from args
                 let hooks = args.hooks.clone();
-
-                // Store hooks in state for use in stop command (will be done in the async block)
                 let state_for_hooks = state.clone();
-
-                // Start transcription session asynchronously
                 let state_clone = state.clone();
                 let sound_manager_clone = sound_manager.clone();
                 let command_executor_clone = command_executor.clone();
+
                 tokio::spawn(async move {
-                    // Store hooks in state for use in stop command
                     *state_for_hooks.current_hooks.lock().await = hooks.clone();
 
-                    // Start playing RecordingStart sound indefinitely
                     let sound_handle = match sound_manager_clone.play_recording_start().await {
                         Ok(handle) => handle,
                         Err(e) => {
@@ -620,13 +607,10 @@ fn handle_command(
                         }
                     };
 
-                    // Try to establish WebSocket connection
                     match transcriber.start_session(language).await {
                         Ok((audio_tx, mut transcript_rx, ws_task, shutdown_tx)) => {
-                            // WebSocket connection successful - stop the RecordingStart sound
                             sound_handle.stop().await;
 
-                            // Now execute on_transcription_start hook after sound has stopped
                             if let Some(ref hooks) = hooks {
                                 if let Some(ref start_hook) = hooks.on_transcription_start {
                                     match start_hook {
@@ -642,13 +626,11 @@ fn handle_command(
                                 }
                             }
 
-                            // Now we can start sending audio frames to the API
                             *state_clone.audio_sender.lock().await = Some(audio_tx);
                             *state_clone.ws_task.lock().await = Some(ws_task);
                             *state_clone.ws_shutdown.lock().await = Some(shutdown_tx);
                             state_clone.is_recording.store(true, Ordering::Relaxed);
 
-                            // Handle transcriptions
                             let state_inner = state_clone.clone();
                             let sound_manager_inner = sound_manager_clone.clone();
                             let command_executor_inner = command_executor_clone.clone();
@@ -661,8 +643,6 @@ fn handle_command(
                                                     "Real-time transcription: \"{}\"",
                                                     transcript
                                                 );
-
-                                                // Execute on_transcription_receive hook or print to stdout
                                                 if let Some(ref hooks) = hooks {
                                                     if let Some(ref receive_hook) =
                                                         hooks.on_transcription_receive
@@ -673,43 +653,46 @@ fn handle_command(
                                                                 command_executor_inner.execute_hook(
                                                                     "on_transcription_receive",
                                                                     command,
-                                                                    transcript.clone()
+                                                                    transcript.clone(),
                                                                 );
                                                             }
                                                         }
                                                     } else {
-                                                        // No receive hook, print to stdout
                                                         println!("{}", transcript);
                                                     }
                                                 } else {
-                                                    // No hooks at all, print to stdout
                                                     println!("{}", transcript);
                                                 }
                                             }
                                         }
                                         Err(e) => {
                                             eprintln!("Transcription error: {}", e);
-                                            // Play error beep
                                             sound_manager_inner.play_error();
+                                            perform_transcription_cleanup(
+                                                &state_inner,
+                                                &sound_manager_inner,
+                                                &command_executor_inner,
+                                                "ToggleTranscriptionError",
+                                            )
+                                            .await;
+                                            return;
                                         }
                                     }
                                 }
-
-                                // Cleanup when stream ends
-                                state_inner.is_recording.store(false, Ordering::Relaxed);
-                                *state_inner.audio_sender.lock().await = None;
-                                eprintln!("Transcription stream ended");
+                                perform_transcription_cleanup(
+                                    &state_inner,
+                                    &sound_manager_inner,
+                                    &command_executor_inner,
+                                    "ToggleStreamEnd",
+                                )
+                                .await;
                             });
 
                             eprintln!("Audio streaming started (toggled)");
                         }
                         Err(e) => {
-                            // WebSocket connection failed - stop the RecordingStart sound
                             sound_handle.stop().await;
-
                             eprintln!("Failed to start transcription session: {}", e);
-                            state_clone.is_recording.store(false, Ordering::Relaxed);
-                            // Play error beep
                             sound_manager_clone.play_error();
                         }
                     }

@@ -37,8 +37,8 @@
 
         package = mkOption {
           type = types.package;
-          default = inputs.self.packages.${pkgs.system}.hotline;
-          defaultText = literalExpression "inputs.self.packages.${pkgs.system}.hotline";
+          default = inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.hotline;
+          defaultText = literalExpression "inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.hotline";
           description = "The package to use for Hotline.";
         };
 

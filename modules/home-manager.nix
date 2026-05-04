@@ -267,13 +267,21 @@
         systemd.user.services.hotline = mkIf cfg.systemdService.enable {
           Unit = {
             Description = "Hotline daemon";
-            After = [ "sound.target" ];
-            Requires = [ "sound.target" ];
+            # PipeWire's ALSA bridge is what exposes the `default` PCM under
+            # user systemd; sound.target is a no-op on PipeWire systems and
+            # gives no real ordering. Wait for pipewire.service so the bridge
+            # is up before cpal opens an ALSA device.
+            After = [ "pipewire.service" "pipewire-pulse.service" ];
+            Wants = [ "pipewire.service" ];
           };
 
           Service = lib.filterAttrs (_: val: val != null) ({
             ExecStart = "${lib.getExe cfg.package} daemon";
             Restart = "on-failure";
+            # Default StartLimitIntervalSec=10s + 5 quick restarts trip
+            # start-limit-hit before the audio stack has come up on slower
+            # boots; back off so transient ALSA errors don't permanently fail.
+            RestartSec = 5;
             EnvironmentFile = cfg.systemdService.environmentFile;
           } // lib.optionalAttrs (cfg.systemdService.environment != { }) {
             Environment = lib.mapAttrsToList (name: value: "${name}=${value}") cfg.systemdService.environment;
